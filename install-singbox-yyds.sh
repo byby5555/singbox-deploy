@@ -130,6 +130,14 @@ generate_ss_password() {
     fi
 }
 
+# 将节点名称转换为可读 tag 后缀
+sanitize_ss_tag_suffix() {
+    local raw="$1"
+    local out
+    out=$(echo "$raw" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]/-/g; s/-\+/-/g; s/^-//; s/-$//')
+    echo "${out:-node}"
+}
+
 # -----------------------
 # 配置节点名称后缀
 echo "请输入节点名称(留空则默认议名):"
@@ -297,7 +305,8 @@ get_config() {
             PORT_SS="${USER_PORT_SS:-$(rand_port)}"
         fi
         PSK_SS=$(generate_ss_password "$SS_METHOD")
-        SS_TAG="ss-in"
+        SS_TAG_SUFFIX=$(sanitize_ss_tag_suffix "${user_name:-main}")
+        SS_TAG="ss-in-${SS_TAG_SUFFIX}"
         SS_NODE_NAME="ss${suffix}"
         info "SS 端口: $PORT_SS"
         info "SS 加密方式: $SS_METHOD"
@@ -903,7 +912,10 @@ echo "=========================================="
 # -----------------------
 # 创建 sb 管理脚本
 SB_PATH="/usr/local/bin/sb"
+SB_PATH_FALLBACK="/usr/bin/sb"
 info "正在创建 sb 管理面板: $SB_PATH"
+
+mkdir -p "$(dirname "$SB_PATH")"
 
 cat > "$SB_PATH" <<'SB_SCRIPT'
 #!/usr/bin/env bash
@@ -1286,9 +1298,11 @@ action_add_ss_node() {
     read -p "请输入 SS 密码(留空自动生成): " ss_psk
     ss_psk="${ss_psk:-$(generate_ss_password "$ss_method")}"
 
-    ss_tag_suffix=$(echo "$ss_name" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]/-/g; s/-\+/-/g; s/^-//; s/-$//')
-    ss_tag_suffix="${ss_tag_suffix:-node}"
-    ss_tag="ss-in-${ss_tag_suffix}-$(date +%s)"
+    ss_tag_suffix=$(sanitize_ss_tag_suffix "$ss_name")
+    ss_tag="ss-in-${ss_tag_suffix}"
+    if jq -e --arg tag "$ss_tag" '.inbounds[] | select((.tag // "") == $tag)' "$CONFIG_PATH" >/dev/null 2>&1; then
+        ss_tag="${ss_tag}-$(date +%s)"
+    fi
 
     info "正在停止服务..."
     service_stop || warn "停止服务失败"
@@ -1304,6 +1318,14 @@ action_add_ss_node() {
       "tag": $tag
     }]
     ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
+
+    if command -v sing-box >/dev/null 2>&1; then
+        if ! sing-box check -c "$CONFIG_PATH" >/dev/null 2>&1; then
+            err "新增 SS 节点后配置校验失败，已回滚"
+            mv -f "${CONFIG_PATH}.bak" "$CONFIG_PATH"
+            return 1
+        fi
+    fi
 
     touch "$SS_META_FILE"
     echo "${ss_tag}|${ss_name}" >> "$SS_META_FILE"
@@ -1363,7 +1385,7 @@ action_uninstall() {
         systemctl daemon-reload 2>/dev/null || true
         apt purge -y sing-box >/dev/null 2>&1 || true
     fi
-    rm -rf /etc/sing-box /var/log/sing-box* /usr/local/bin/sb /usr/bin/sing-box /root/node_names.txt 2>/dev/null || true
+    rm -rf /etc/sing-box /var/log/sing-box* /usr/local/bin/sb /usr/bin/sb /usr/bin/sing-box /root/node_names.txt 2>/dev/null || true
     info "卸载完成"
 }
 
@@ -1723,4 +1745,13 @@ done
 SB_SCRIPT
 
 chmod +x "$SB_PATH"
-info "✅ 管理面板已创建,可输入 sb 打开管理面板"
+
+# 兼容某些系统 PATH 未包含 /usr/local/bin 的场景
+ln -sf "$SB_PATH" "$SB_PATH_FALLBACK" 2>/dev/null || true
+
+if command -v sb >/dev/null 2>&1; then
+    info "✅ 管理面板已创建,可输入 sb 打开管理面板"
+else
+    warn "未在 PATH 中检测到 sb，请手动执行: $SB_PATH"
+    warn "你也可以创建软链: ln -sf $SB_PATH /usr/bin/sb"
+fi

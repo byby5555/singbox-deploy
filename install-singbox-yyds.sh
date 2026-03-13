@@ -677,6 +677,7 @@ setup_service() {
     
     if [ "$OS" = "alpine" ]; then
         SERVICE_PATH="/etc/init.d/sing-box"
+        local restart_out start_out
         
         cat > "$SERVICE_PATH" <<'OPENRC'
 #!/sbin/openrc-run
@@ -706,11 +707,22 @@ OPENRC
         
         chmod +x "$SERVICE_PATH"
         rc-update add sing-box default >/dev/null 2>&1 || warn "添加开机自启失败"
-        rc-service sing-box restart || {
-            err "服务启动失败"
-            tail -20 /var/log/sing-box.err 2>/dev/null || tail -20 /var/log/sing-box.log 2>/dev/null || true
-            exit 1
-        }
+
+        if ! restart_out=$(rc-service sing-box restart 2>&1); then
+            if echo "$restart_out" | grep -qi "already starting"; then
+                warn "检测到服务正在启动中，等待状态稳定..."
+            else
+                warn "服务重启失败，尝试直接启动..."
+                start_out=$(rc-service sing-box start 2>&1 || true)
+                if ! rc-service sing-box status >/dev/null 2>&1; then
+                    err "服务启动失败"
+                    echo "$restart_out"
+                    [ -n "$start_out" ] && echo "$start_out"
+                    tail -20 /var/log/sing-box.err 2>/dev/null || tail -20 /var/log/sing-box.log 2>/dev/null || true
+                    exit 1
+                fi
+            fi
+        fi
         
         sleep 2
         if rc-service sing-box status >/dev/null 2>&1; then
@@ -938,7 +950,18 @@ service_stop() {
     [ "$OS" = "alpine" ] && rc-service "$SERVICE_NAME" stop || systemctl stop "$SERVICE_NAME"
 }
 service_restart() {
-    [ "$OS" = "alpine" ] && rc-service "$SERVICE_NAME" restart || systemctl restart "$SERVICE_NAME"
+    if [ "$OS" = "alpine" ]; then
+        local out
+        if ! out=$(rc-service "$SERVICE_NAME" restart 2>&1); then
+            if echo "$out" | grep -qi "already starting"; then
+                warn "服务正在启动中，跳过重复重启"
+                return 0
+            fi
+            rc-service "$SERVICE_NAME" start
+        fi
+    else
+        systemctl restart "$SERVICE_NAME"
+    fi
 }
 service_status() {
     [ "$OS" = "alpine" ] && rc-service "$SERVICE_NAME" status || systemctl status "$SERVICE_NAME" --no-pager
@@ -1520,7 +1543,7 @@ depend() { need net; }
 SVC
     chmod +x /etc/init.d/sing-box
     rc-update add sing-box default
-    rc-service sing-box restart
+    rc-service sing-box restart || rc-service sing-box start || true
 else
     cat > /etc/systemd/system/sing-box.service <<'SYSTEMD'
 [Unit]

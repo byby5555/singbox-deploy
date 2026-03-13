@@ -109,6 +109,35 @@ rand_uuid() {
     echo "$uuid"
 }
 
+# 按加密方式生成 Shadowsocks 密码
+generate_ss_password() {
+    local method="$1"
+    local key_len=16
+
+    case "$method" in
+        2022-blake3-aes-128-gcm) key_len=16 ;;
+        2022-blake3-aes-256-gcm|2022-blake3-chacha20-poly1305) key_len=32 ;;
+        *)
+            rand_pass
+            return 0
+            ;;
+    esac
+
+    if command -v openssl >/dev/null 2>&1; then
+        openssl rand "$key_len" | base64 | tr -d '\n\r'
+    else
+        head -c "$key_len" /dev/urandom | base64 | tr -d '\n\r'
+    fi
+}
+
+# 将节点名称转换为可读 tag 后缀
+sanitize_ss_tag_suffix() {
+    local raw="$1"
+    local out
+    out=$(echo "$raw" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]/-/g; s/-\+/-/g; s/^-//; s/-$//')
+    echo "${out:-node}"
+}
+
 # -----------------------
 # 配置节点名称后缀
 echo "请输入节点名称(留空则默认议名):"
@@ -189,14 +218,18 @@ select_ss_method() {
     
     info "=== 选择 Shadowsocks 加密方式 ==="
     echo "1) 2022-blake3-aes-128-gcm (推荐)"
-    echo "2) aes-128-gcm"
+    echo "2) 2022-blake3-aes-256-gcm"
+    echo "3) 2022-blake3-chacha20-poly1305"
+    echo "4) xchacha20-poly1305 (xchacha20-ietf-poly1305)"
     echo ""
     echo "请输入选择(默认为 1):"
     read -r ss_method_choice
-    
+
     case "${ss_method_choice:-1}" in
         1) SS_METHOD="2022-blake3-aes-128-gcm" ;;
-        2) SS_METHOD="aes-128-gcm" ;;
+        2) SS_METHOD="2022-blake3-aes-256-gcm" ;;
+        3) SS_METHOD="2022-blake3-chacha20-poly1305" ;;
+        4) SS_METHOD="xchacha20-ietf-poly1305" ;;
         *) 
             warn "无效选择，使用默认方式: 2022-blake3-aes-128-gcm"
             SS_METHOD="2022-blake3-aes-128-gcm"
@@ -271,7 +304,10 @@ get_config() {
             read -p "请输入 SS 端口(留空则随机 10000-60000): " USER_PORT_SS
             PORT_SS="${USER_PORT_SS:-$(rand_port)}"
         fi
-        PSK_SS=$(rand_pass)
+        PSK_SS=$(generate_ss_password "$SS_METHOD")
+        SS_TAG_SUFFIX=$(sanitize_ss_tag_suffix "${user_name:-main}")
+        SS_TAG="ss-in-${SS_TAG_SUFFIX}"
+        SS_NODE_NAME="ss${suffix}"
         info "SS 端口: $PORT_SS"
         info "SS 加密方式: $SS_METHOD"
         info "SS 密码已自动生成"
@@ -461,12 +497,13 @@ create_config() {
       "listen_port": PORT_SS_PLACEHOLDER,
       "method": "METHOD_SS_PLACEHOLDER",
       "password": "PSK_SS_PLACEHOLDER",
-      "tag": "ss-in"
+      "tag": "SS_TAG_PLACEHOLDER"
     }
 INBOUND_SS
         sed -i "s|PORT_SS_PLACEHOLDER|$PORT_SS|g" "$TEMP_INBOUNDS"
         sed -i "s|METHOD_SS_PLACEHOLDER|$SS_METHOD|g" "$TEMP_INBOUNDS"
         sed -i "s|PSK_SS_PLACEHOLDER|$PSK_SS|g" "$TEMP_INBOUNDS"
+        sed -i "s|SS_TAG_PLACEHOLDER|$SS_TAG|g" "$TEMP_INBOUNDS"
         need_comma=true
     fi
     
@@ -627,6 +664,13 @@ CACHEEOF
     # 全局写入 CUSTOM_IP（哪怕为空也写）
     echo "CUSTOM_IP=$CUSTOM_IP" >> /etc/sing-box/.config_cache
 
+    # 保存 SS 节点名称映射（tag|name），便于多 SS 节点管理
+    SS_META_FILE="/etc/sing-box/.ss_nodes"
+    : > "$SS_META_FILE"
+    if $ENABLE_SS; then
+        echo "${SS_TAG}|${SS_NODE_NAME:-ss}" >> "$SS_META_FILE"
+    fi
+
     info "配置缓存已保存到 /etc/sing-box/.config_cache"
 }
 
@@ -642,6 +686,7 @@ setup_service() {
     
     if [ "$OS" = "alpine" ]; then
         SERVICE_PATH="/etc/init.d/sing-box"
+        local restart_out start_out
         
         cat > "$SERVICE_PATH" <<'OPENRC'
 #!/sbin/openrc-run
@@ -671,11 +716,22 @@ OPENRC
         
         chmod +x "$SERVICE_PATH"
         rc-update add sing-box default >/dev/null 2>&1 || warn "添加开机自启失败"
-        rc-service sing-box restart || {
-            err "服务启动失败"
-            tail -20 /var/log/sing-box.err 2>/dev/null || tail -20 /var/log/sing-box.log 2>/dev/null || true
-            exit 1
-        }
+
+        if ! restart_out=$(rc-service sing-box restart 2>&1); then
+            if echo "$restart_out" | grep -qi "already starting"; then
+                warn "检测到服务正在启动中，等待状态稳定..."
+            else
+                warn "服务重启失败，尝试直接启动..."
+                start_out=$(rc-service sing-box start 2>&1 || true)
+                if ! rc-service sing-box status >/dev/null 2>&1; then
+                    err "服务启动失败"
+                    echo "$restart_out"
+                    [ -n "$start_out" ] && echo "$start_out"
+                    tail -20 /var/log/sing-box.err 2>/dev/null || tail -20 /var/log/sing-box.log 2>/dev/null || true
+                    exit 1
+                fi
+            fi
+        fi
         
         sleep 2
         if rc-service sing-box status >/dev/null 2>&1; then
@@ -769,13 +825,24 @@ generate_uris() {
     local host="$PUB_IP"
     
     if $ENABLE_SS; then
-        local ss_userinfo="${SS_METHOD}:${PSK_SS}"
-        ss_encoded=$(printf "%s" "$ss_userinfo" | sed 's/:/%3A/g; s/+/%2B/g; s/\//%2F/g; s/=/%3D/g')
-        ss_b64=$(printf "%s" "$ss_userinfo" | base64 -w0 2>/dev/null || printf "%s" "$ss_userinfo" | base64 | tr -d '\n')
-
         echo "=== Shadowsocks (SS) ==="
-        echo "ss://${ss_encoded}@${host}:${PORT_SS}#ss${suffix}"
-        echo "ss://${ss_b64}@${host}:${PORT_SS}#ss${suffix}"
+        jq -c '.inbounds[] | select(.type=="shadowsocks") | {port:.listen_port,method:.method,password:.password,tag:(.tag//"ss")}' "$CONFIG_PATH" 2>/dev/null | \
+        while IFS= read -r ss_item; do
+            local ss_port ss_method ss_psk ss_tag ss_name ss_userinfo ss_encoded ss_b64
+            ss_port=$(echo "$ss_item" | jq -r '.port')
+            ss_method=$(echo "$ss_item" | jq -r '.method')
+            ss_psk=$(echo "$ss_item" | jq -r '.password')
+            ss_tag=$(echo "$ss_item" | jq -r '.tag')
+            ss_name=$(awk -F'|' -v t="$ss_tag" '$1==t{print $2}' /etc/sing-box/.ss_nodes 2>/dev/null | head -n1)
+            ss_name="${ss_name:-$ss_tag}"
+
+            ss_userinfo="${ss_method}:${ss_psk}"
+            ss_encoded=$(printf "%s" "$ss_userinfo" | sed 's/:/%3A/g; s/+/%2B/g; s/\//%2F/g; s/=/%3D/g')
+            ss_b64=$(printf "%s" "$ss_userinfo" | base64 -w0 2>/dev/null || printf "%s" "$ss_userinfo" | base64 | tr -d '\n')
+
+            echo "ss://${ss_encoded}@${host}:${ss_port}#${ss_name}"
+            echo "ss://${ss_b64}@${host}:${ss_port}#${ss_name}"
+        done
         echo ""
     fi
     
@@ -845,7 +912,10 @@ echo "=========================================="
 # -----------------------
 # 创建 sb 管理脚本
 SB_PATH="/usr/local/bin/sb"
+SB_PATH_FALLBACK="/usr/bin/sb"
 info "正在创建 sb 管理面板: $SB_PATH"
+
+mkdir -p "$(dirname "$SB_PATH")"
 
 cat > "$SB_PATH" <<'SB_SCRIPT'
 #!/usr/bin/env bash
@@ -857,6 +927,7 @@ err()  { echo -e "\033[1;31m[ERR]\033[0m $*" >&2; }
 
 CONFIG_PATH="/etc/sing-box/config.json"
 CACHE_FILE="/etc/sing-box/.config_cache"
+SS_META_FILE="/etc/sing-box/.ss_nodes"
 SERVICE_NAME="sing-box"
 
 # 检测系统
@@ -891,7 +962,18 @@ service_stop() {
     [ "$OS" = "alpine" ] && rc-service "$SERVICE_NAME" stop || systemctl stop "$SERVICE_NAME"
 }
 service_restart() {
-    [ "$OS" = "alpine" ] && rc-service "$SERVICE_NAME" restart || systemctl restart "$SERVICE_NAME"
+    if [ "$OS" = "alpine" ]; then
+        local out
+        if ! out=$(rc-service "$SERVICE_NAME" restart 2>&1); then
+            if echo "$out" | grep -qi "already starting"; then
+                warn "服务正在启动中，跳过重复重启"
+                return 0
+            fi
+            rc-service "$SERVICE_NAME" start
+        fi
+    else
+        systemctl restart "$SERVICE_NAME"
+    fi
 }
 service_status() {
     [ "$OS" = "alpine" ] && rc-service "$SERVICE_NAME" status || systemctl status "$SERVICE_NAME" --no-pager
@@ -901,6 +983,26 @@ service_status() {
 rand_port() { shuf -i 10000-60000 -n 1 2>/dev/null || echo $((RANDOM % 50001 + 10000)); }
 rand_pass() { openssl rand -base64 16 | tr -d '\n\r' || head -c 16 /dev/urandom | base64 | tr -d '\n\r'; }
 rand_uuid() { cat /proc/sys/kernel/random/uuid 2>/dev/null || openssl rand -hex 16 | sed 's/\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)/\1\2\3\4-\5\6-\7\8-\9\10-\11\12\13\14\15\16/'; }
+
+generate_ss_password() {
+    local method="$1"
+    local key_len=16
+
+    case "$method" in
+        2022-blake3-aes-128-gcm) key_len=16 ;;
+        2022-blake3-aes-256-gcm|2022-blake3-chacha20-poly1305) key_len=32 ;;
+        *)
+            rand_pass
+            return 0
+            ;;
+    esac
+
+    if command -v openssl >/dev/null 2>&1; then
+        openssl rand "$key_len" | base64 | tr -d '\n\r'
+    else
+        head -c "$key_len" /dev/urandom | base64 | tr -d '\n\r'
+    fi
+}
 
 # URL 编码
 url_encode() {
@@ -983,13 +1085,23 @@ generate_uris() {
     > "$URI_FILE"
     
     if [ "${ENABLE_SS:-false}" = "true" ]; then
-        ss_userinfo="${SS_METHOD}:${SS_PSK}"
-        ss_encoded=$(url_encode "$ss_userinfo")
-        ss_b64=$(printf "%s" "$ss_userinfo" | base64 -w0 2>/dev/null || printf "%s" "$ss_userinfo" | base64 | tr -d '\n')
-        
         echo "=== Shadowsocks (SS) ===" >> "$URI_FILE"
-        echo "ss://${ss_encoded}@${PUBLIC_IP}:${SS_PORT}#ss${node_suffix}" >> "$URI_FILE"
-        echo "ss://${ss_b64}@${PUBLIC_IP}:${SS_PORT}#ss${node_suffix}" >> "$URI_FILE"
+        jq -c '.inbounds[] | select(.type=="shadowsocks") | {port:.listen_port,method:.method,password:.password,tag:(.tag//"ss")}' "$CONFIG_PATH" 2>/dev/null | \
+        while IFS= read -r ss_item; do
+            ss_port=$(echo "$ss_item" | jq -r '.port')
+            ss_method=$(echo "$ss_item" | jq -r '.method')
+            ss_psk=$(echo "$ss_item" | jq -r '.password')
+            ss_tag=$(echo "$ss_item" | jq -r '.tag')
+            ss_name=$(awk -F'|' -v t="$ss_tag" '$1==t{print $2}' "$SS_META_FILE" 2>/dev/null | head -n1)
+            ss_name="${ss_name:-$ss_tag}"
+
+            ss_userinfo="${ss_method}:${ss_psk}"
+            ss_encoded=$(url_encode "$ss_userinfo")
+            ss_b64=$(printf "%s" "$ss_userinfo" | base64 -w0 2>/dev/null || printf "%s" "$ss_userinfo" | base64 | tr -d '\n')
+
+            echo "ss://${ss_encoded}@${PUBLIC_IP}:${ss_port}#${ss_name}" >> "$URI_FILE"
+            echo "ss://${ss_b64}@${PUBLIC_IP}:${ss_port}#${ss_name}" >> "$URI_FILE"
+        done
         echo "" >> "$URI_FILE"
     fi
     
@@ -1158,6 +1270,86 @@ action_reset_reality() {
     generate_uris || warn "生成 URI 失败"
 }
 
+# 新增 SS 节点（支持多节点并存）
+action_add_ss_node() {
+    read_config || return 1
+
+    read -p "请输入 SS 节点名称(默认: ss-extra): " ss_name
+    ss_name="${ss_name:-ss-extra}"
+
+    echo "请选择 SS 加密方式:"
+    echo "1) 2022-blake3-aes-128-gcm"
+    echo "2) 2022-blake3-aes-256-gcm"
+    echo "3) 2022-blake3-chacha20-poly1305"
+    echo "4) xchacha20-ietf-poly1305"
+    read -p "请输入选择(默认 1): " ss_method_choice
+
+    case "${ss_method_choice:-1}" in
+        1) ss_method="2022-blake3-aes-128-gcm" ;;
+        2) ss_method="2022-blake3-aes-256-gcm" ;;
+        3) ss_method="2022-blake3-chacha20-poly1305" ;;
+        4) ss_method="xchacha20-ietf-poly1305" ;;
+        *) ss_method="2022-blake3-aes-128-gcm" ;;
+    esac
+
+    read -p "请输入 SS 端口(留空随机 10000-60000): " ss_port
+    ss_port="${ss_port:-$(rand_port)}"
+
+    read -p "请输入 SS 密码(留空自动生成): " ss_psk
+    ss_psk="${ss_psk:-$(generate_ss_password "$ss_method")}"
+
+    ss_tag_suffix=$(sanitize_ss_tag_suffix "$ss_name")
+    ss_tag="ss-in-${ss_tag_suffix}"
+    if jq -e --arg tag "$ss_tag" '.inbounds[] | select((.tag // "") == $tag)' "$CONFIG_PATH" >/dev/null 2>&1; then
+        ss_tag="${ss_tag}-$(date +%s)"
+    fi
+
+    info "正在停止服务..."
+    service_stop || warn "停止服务失败"
+    cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"
+
+    jq --argjson port "$ss_port" --arg method "$ss_method" --arg psk "$ss_psk" --arg tag "$ss_tag" '
+    .inbounds += [{
+      "type": "shadowsocks",
+      "listen": "::",
+      "listen_port": $port,
+      "method": $method,
+      "password": $psk,
+      "tag": $tag
+    }]
+    ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
+
+    if command -v sing-box >/dev/null 2>&1; then
+        if ! sing-box check -c "$CONFIG_PATH" >/dev/null 2>&1; then
+            err "新增 SS 节点后配置校验失败，已回滚"
+            mv -f "${CONFIG_PATH}.bak" "$CONFIG_PATH"
+            return 1
+        fi
+    fi
+
+    touch "$SS_META_FILE"
+    echo "${ss_tag}|${ss_name}" >> "$SS_META_FILE"
+
+    if [ -f "$CACHE_FILE" ]; then
+        sed -i 's/ENABLE_SS=false/ENABLE_SS=true/' "$CACHE_FILE" 2>/dev/null || true
+        grep -q '^ENABLE_SS=' "$CACHE_FILE" || echo 'ENABLE_SS=true' >> "$CACHE_FILE"
+    else
+        echo 'ENABLE_SS=true' > "$CACHE_FILE"
+    fi
+
+    if [ -f /etc/sing-box/.protocols ]; then
+        sed -i 's/ENABLE_SS=false/ENABLE_SS=true/' /etc/sing-box/.protocols 2>/dev/null || true
+        grep -q '^ENABLE_SS=' /etc/sing-box/.protocols || echo 'ENABLE_SS=true' >> /etc/sing-box/.protocols
+    else
+        echo 'ENABLE_SS=true' > /etc/sing-box/.protocols
+    fi
+
+    info "已新增 SS 节点: ${ss_name} (${ss_method}:${ss_port})"
+    service_start || warn "启动服务失败"
+    sleep 1
+    generate_uris || warn "生成 URI 失败"
+}
+
 # 更新sing-box
 action_update() {
     info "开始更新 sing-box..."
@@ -1193,7 +1385,7 @@ action_uninstall() {
         systemctl daemon-reload 2>/dev/null || true
         apt purge -y sing-box >/dev/null 2>&1 || true
     fi
-    rm -rf /etc/sing-box /var/log/sing-box* /usr/local/bin/sb /usr/bin/sing-box /root/node_names.txt 2>/dev/null || true
+    rm -rf /etc/sing-box /var/log/sing-box* /usr/local/bin/sb /usr/bin/sb /usr/bin/sing-box /root/node_names.txt 2>/dev/null || true
     info "卸载完成"
 }
 
@@ -1373,7 +1565,7 @@ depend() { need net; }
 SVC
     chmod +x /etc/init.d/sing-box
     rc-update add sing-box default
-    rc-service sing-box restart
+    rc-service sing-box restart || rc-service sing-box start || true
 else
     cat > /etc/systemd/system/sing-box.service <<'SYSTEMD'
 [Unit]
@@ -1498,6 +1690,10 @@ MENU
     MENU_MAP[$option]="relay"
     echo "$((option))) 生成线路机脚本(出口为本机ss协议)"
     option=$((option + 1))
+
+    MENU_MAP[$option]="add_ss"
+    echo "$((option))) 新增 SS 节点(自定义参数)"
+    option=$((option + 1))
     
     MENU_MAP[$option]="uninstall"
     echo "$((option))) 卸载 sing-box"
@@ -1537,6 +1733,7 @@ while true; do
                 status) service_status ;;
                 update) action_update ;;
                 relay) action_generate_relay ;;
+                add_ss) action_add_ss_node ;;
                 uninstall) action_uninstall; exit 0 ;;
                 *) warn "无效选项: $opt" ;;
             esac
@@ -1548,4 +1745,13 @@ done
 SB_SCRIPT
 
 chmod +x "$SB_PATH"
-info "✅ 管理面板已创建,可输入 sb 打开管理面板"
+
+# 兼容某些系统 PATH 未包含 /usr/local/bin 的场景
+ln -sf "$SB_PATH" "$SB_PATH_FALLBACK" 2>/dev/null || true
+
+if command -v sb >/dev/null 2>&1; then
+    info "✅ 管理面板已创建,可输入 sb 打开管理面板"
+else
+    warn "未在 PATH 中检测到 sb，请手动执行: $SB_PATH"
+    warn "你也可以创建软链: ln -sf $SB_PATH /usr/bin/sb"
+fi

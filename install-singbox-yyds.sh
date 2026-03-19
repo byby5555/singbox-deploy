@@ -637,9 +637,6 @@ INBOUND_REALITY
           "alterId": 0
         }
       ],
-      "transport": {
-        "type": "tcp"
-      },
       "tag": "vmess-in"
     }
 INBOUND_VMESS
@@ -962,7 +959,7 @@ $ENABLE_SS && echo "   SS 端口: $PORT_SS | 密码: $PSK_SS | 加密: $SS_METHO
 $ENABLE_HY2 && echo "   HY2 端口: $PORT_HY2 | 密码: $PSK_HY2"
 $ENABLE_TUIC && echo "   TUIC 端口: $PORT_TUIC | UUID: $UUID_TUIC | 密码: $PSK_TUIC"
 $ENABLE_REALITY && echo "   Reality 端口: $PORT_REALITY | UUID: $UUID"
-$ENABLE_VMESS && echo "   VMess 端口: $PORT_VMESS | UUID: $VMESS_UUID | alterId: 0 | 传输: tcp(transport) | 回源出站: chacha20-poly1305/tcp"
+$ENABLE_VMESS && echo "   VMess 端口: $PORT_VMESS | UUID: $VMESS_UUID | alterId: 0 | 传输: tcp(默认) | 回源出站: chacha20-poly1305/tcp"
 echo "   服务器: $PUB_IP"
 echo "   Reality server_name(SNI): ${REALITY_SNI:-addons.mozilla.org}"
 echo ""
@@ -1513,9 +1510,6 @@ action_add_vmess_node() {
       "users": [
         { "uuid": $uuid, "alterId": 0 }
       ],
-      "transport": {
-        "type": "tcp"
-      },
       "tag": $tag
     }]
     ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"

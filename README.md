@@ -64,6 +64,7 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/byby5555/singbox-deploy/
 ## 🆕 VMess over TCP（AEAD）说明
 
 - VMess 当前实现为 **纯 TCP**，不启用 TLS / WS / gRPC / Reality。
+- sing-box VMess 入站在纯 TCP 下无需额外 transport 字段（默认即 TCP）。
 - VMess 认证使用 **UUID**，不是 password。
 - `alterId=0`（AEAD），不启用 legacy 模式。
 - VMess 回源出站默认 `security=chacha20-poly1305`，`network=tcp`。
@@ -95,9 +96,6 @@ export SINGBOX_PORT_VMESS="20086"
       "alterId": 0
     }
   ],
-  "transport": {
-    "type": "tcp"
-  },
   "tag": "vmess-in"
 }
 ```

@@ -940,8 +940,16 @@ generate_uris() {
             vmess_tag=$(echo "$vmess_item" | jq -r '.tag')
             vmess_name=$(awk -F'|' -v t="$vmess_tag" '$1==t{print $2}' /etc/sing-box/.vmess_nodes 2>/dev/null | head -n1)
             vmess_name="${vmess_name:-$vmess_tag}"
-            # VMess 使用 UUID，而不是 password；alterId=0 表示启用 AEAD。
-            echo "vmess://${vmess_uuid}@${host}:${vmess_port}?security=chacha20-poly1305&network=tcp&alterId=0#${vmess_name}"
+            # VMess 分享链接使用 base64(JSON) 结构，避免客户端 atob 解码报错。
+            local vmess_json vmess_b64
+            vmess_json=$(jq -nc \
+                --arg ps "$vmess_name" \
+                --arg add "$host" \
+                --arg port "$vmess_port" \
+                --arg id "$vmess_uuid" \
+                '{v:"2",ps:$ps,add:$add,port:$port,id:$id,aid:"0",net:"tcp",type:"none",host:"",path:"",tls:""}')
+            vmess_b64=$(printf "%s" "$vmess_json" | base64 -w0 2>/dev/null || printf "%s" "$vmess_json" | base64 | tr -d '\n')
+            echo "vmess://${vmess_b64}"
         done
         echo ""
     fi
@@ -1228,8 +1236,15 @@ generate_uris() {
             vmess_tag=$(echo "$vmess_item" | jq -r '.tag')
             vmess_name=$(awk -F'|' -v t="$vmess_tag" '$1==t{print $2}' "$VMESS_META_FILE" 2>/dev/null | head -n1)
             vmess_name="${vmess_name:-$vmess_tag}"
-            # VMess 使用 UUID，不使用 password；alterId=0 即 AEAD。
-            echo "vmess://${vmess_uuid}@${PUBLIC_IP}:${vmess_port}?security=chacha20-poly1305&network=tcp&alterId=0#${vmess_name}" >> "$URI_FILE"
+            # VMess 分享链接使用 base64(JSON) 结构，避免客户端 atob 解码报错。
+            vmess_json=$(jq -nc \
+                --arg ps "$vmess_name" \
+                --arg add "$PUBLIC_IP" \
+                --arg port "$vmess_port" \
+                --arg id "$vmess_uuid" \
+                '{v:"2",ps:$ps,add:$add,port:$port,id:$id,aid:"0",net:"tcp",type:"none",host:"",path:"",tls:""}')
+            vmess_b64=$(printf "%s" "$vmess_json" | base64 -w0 2>/dev/null || printf "%s" "$vmess_json" | base64 | tr -d '\n')
+            echo "vmess://${vmess_b64}" >> "$URI_FILE"
         done
         echo "" >> "$URI_FILE"
     fi

@@ -68,6 +68,7 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/byby5555/singbox-deploy/
 - VMess 认证使用 **UUID**，不是 password。
 - `alterId=0`（AEAD），不启用 legacy 模式。
 - VMess 回源出站默认 `security=chacha20-poly1305`，`network=tcp`。
+- VMess 导出链接使用标准 `vmess://base64(JSON)` 格式，避免客户端 `atob` 解码报错。
 
 ### 环境变量优先级与配置
 

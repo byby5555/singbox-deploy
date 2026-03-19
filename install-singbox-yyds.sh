@@ -1581,19 +1581,45 @@ action_uninstall() {
     [[ ! "$confirm" =~ ^[Yy]$ ]] && info "已取消" && return 0
     
     info "正在卸载..."
-    service_stop || true
+
+    # 先禁用自启，避免 OpenRC supervise-daemon 或 systemd 自动拉起
     if [ "$OS" = "alpine" ]; then
         rc-update del sing-box default 2>/dev/null || true
+        rc-service sing-box stop 2>/dev/null || true
+        rm -f /run/sing-box.pid /run/sing-box/*.pid 2>/dev/null || true
+        pkill -TERM -x sing-box 2>/dev/null || true
+        sleep 1
+        pkill -KILL -x sing-box 2>/dev/null || true
         rm -f /etc/init.d/sing-box
         apk del sing-box 2>/dev/null || true
     else
-        systemctl stop sing-box 2>/dev/null || true
-        systemctl disable sing-box 2>/dev/null || true
+        systemctl disable --now sing-box 2>/dev/null || true
+        systemctl kill sing-box 2>/dev/null || true
+        pkill -TERM -x sing-box 2>/dev/null || true
+        sleep 1
+        pkill -KILL -x sing-box 2>/dev/null || true
         rm -f /etc/systemd/system/sing-box.service
         systemctl daemon-reload 2>/dev/null || true
         apt purge -y sing-box >/dev/null 2>&1 || true
     fi
+
+    # 最终兜底：确保进程彻底退出
+    for _ in 1 2 3; do
+        if ! pgrep -x sing-box >/dev/null 2>&1; then
+            break
+        fi
+        pkill -TERM -x sing-box 2>/dev/null || true
+        sleep 1
+    done
+    pgrep -x sing-box >/dev/null 2>&1 && pkill -KILL -x sing-box 2>/dev/null || true
+
     rm -rf /etc/sing-box /var/log/sing-box* /usr/local/bin/sb /usr/bin/sing-box /root/node_names.txt 2>/dev/null || true
+
+    if pgrep -x sing-box >/dev/null 2>&1; then
+        err "卸载后仍检测到 sing-box 进程，请手动检查: pgrep -a sing-box"
+        return 1
+    fi
+
     info "卸载完成"
 }
 

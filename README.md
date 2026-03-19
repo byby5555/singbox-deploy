@@ -59,3 +59,44 @@
 
 ```bash
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/byby5555/singbox-deploy/main/install-singbox-yyds.sh)"
+```
+
+## 🆕 VMess over TCP（AEAD）说明
+
+- VMess 当前实现为 **纯 TCP**，不启用 TLS / WS / gRPC / Reality。
+- VMess 认证使用 **UUID**，不是 password。
+- `alterId=0`（AEAD），不启用 legacy 模式。
+- 默认 `security=chacha20-poly1305`，`network=tcp`。
+
+### 环境变量优先级与配置
+
+启用 VMess 时，UUID 读取优先级如下：
+1. `SINGBOX_VMESS_UUID`（环境变量，最高优先级）
+2. 现有 `/etc/sing-box/config.json` 中 vmess 用户 UUID
+3. 两者都没有则明确报错（不会静默随机生成）
+
+可用环境变量：
+
+```bash
+export SINGBOX_VMESS_UUID="11111111-2222-3333-4444-555555555555"
+export SINGBOX_PORT_VMESS="20086"
+```
+
+### 最小可运行示例（仅演示 VMess 入站核心字段）
+
+```json
+{
+  "type": "vmess",
+  "listen": "0.0.0.0",
+  "listen_port": 20086,
+  "users": [
+    {
+      "uuid": "11111111-2222-3333-4444-555555555555",
+      "alterId": 0
+    }
+  ],
+  "security": "chacha20-poly1305",
+  "network": "tcp",
+  "tag": "vmess-in"
+}
+```

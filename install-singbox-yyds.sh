@@ -149,6 +149,7 @@ select_protocols() {
     echo "2) Hysteria2 (HY2)"
     echo "3) TUIC"
     echo "4) VLESS Reality"
+    echo "5) VMess (TCP)"
     echo ""
     echo "请输入要部署的协议编号(多个用空格分隔,如: 1 2 4):"
     read -r protocol_input
@@ -158,6 +159,7 @@ select_protocols() {
     ENABLE_HY2=false
     ENABLE_TUIC=false
     ENABLE_REALITY=false
+    ENABLE_VMESS=false
     
     for num in $protocol_input; do
         case "$num" in
@@ -165,11 +167,12 @@ select_protocols() {
             2) ENABLE_HY2=true ;;
             3) ENABLE_TUIC=true ;;
             4) ENABLE_REALITY=true ;;
+            5) ENABLE_VMESS=true ;;
             *) warn "无效选项: $num" ;;
         esac
     done
     
-    if ! $ENABLE_SS && ! $ENABLE_HY2 && ! $ENABLE_TUIC && ! $ENABLE_REALITY; then
+    if ! $ENABLE_SS && ! $ENABLE_HY2 && ! $ENABLE_TUIC && ! $ENABLE_REALITY && ! $ENABLE_VMESS; then
         err "未选择任何协议,退出安装"
         exit 1
     fi
@@ -181,6 +184,7 @@ ENABLE_SS=$ENABLE_SS
 ENABLE_HY2=$ENABLE_HY2
 ENABLE_TUIC=$ENABLE_TUIC
 ENABLE_REALITY=$ENABLE_REALITY
+ENABLE_VMESS=$ENABLE_VMESS
 EOF
     
     info "已选择协议:"
@@ -188,12 +192,14 @@ EOF
     $ENABLE_HY2 && echo "  - Hysteria2"
     $ENABLE_TUIC && echo "  - TUIC"
     $ENABLE_REALITY && echo "  - VLESS Reality"
+    $ENABLE_VMESS && echo "  - VMess (TCP)"
     
     # 导出为全局变量（确保后续脚本可以访问）
     export ENABLE_SS
     export ENABLE_HY2
     export ENABLE_TUIC
     export ENABLE_REALITY
+    export ENABLE_VMESS
 }
 
 # 创建配置目录
@@ -342,6 +348,35 @@ get_config() {
         UUID=$(rand_uuid)
         info "Reality 端口: $PORT_REALITY"
         info "Reality UUID 已自动生成"
+    fi
+
+    if $ENABLE_VMESS; then
+        info "=== 配置 VMess (TCP) ==="
+        if [ -n "${SINGBOX_PORT_VMESS:-}" ]; then
+            PORT_VMESS="$SINGBOX_PORT_VMESS"
+        else
+            read -p "请输入 VMess 端口(留空则随机 10000-60000): " USER_PORT_VMESS
+            PORT_VMESS="${USER_PORT_VMESS:-$(rand_port)}"
+        fi
+
+        VMESS_UUID="${SINGBOX_VMESS_UUID:-}"
+        VMESS_UUID_SOURCE="环境变量"
+        if [ -z "$VMESS_UUID" ] && [ -f /etc/sing-box/config.json ]; then
+            VMESS_UUID=$(jq -r '.inbounds[] | select(.type=="vmess") | .users[0].uuid // empty' /etc/sing-box/config.json 2>/dev/null | head -n1)
+            VMESS_UUID_SOURCE="配置文件"
+        fi
+        if [ -z "$VMESS_UUID" ]; then
+            warn "未检测到 VMess UUID，自动生成高强度随机 UUID。"
+            VMESS_UUID=$(rand_uuid)
+            VMESS_UUID_SOURCE="自动生成"
+        fi
+
+        VMESS_SECURITY="chacha20-poly1305"
+        VMESS_NETWORK="tcp"
+        VMESS_TAG="vmess-in"
+        VMESS_NODE_NAME="vmess${suffix}"
+        info "VMess 端口: $PORT_VMESS"
+        info "VMess UUID 来源: $VMESS_UUID_SOURCE"
     fi
     
     info "配置完成，继续安装..."
@@ -589,6 +624,30 @@ INBOUND_REALITY
         sed -i "s|REALITY_SNI_PLACEHOLDER|$REALITY_SNI|g" "$TEMP_INBOUNDS"
     fi
 
+    if $ENABLE_VMESS; then
+        $need_comma && echo "," >> "$TEMP_INBOUNDS"
+        cat >> "$TEMP_INBOUNDS" <<'INBOUND_VMESS'
+    {
+      "type": "vmess",
+      "listen": "0.0.0.0",
+      "listen_port": PORT_VMESS_PLACEHOLDER,
+      "users": [
+        {
+          "uuid": "VMESS_UUID_PLACEHOLDER",
+          "alterId": 0
+        }
+      ],
+      "transport": {
+        "type": "tcp"
+      },
+      "tag": "vmess-in"
+    }
+INBOUND_VMESS
+        sed -i "s|PORT_VMESS_PLACEHOLDER|$PORT_VMESS|g" "$TEMP_INBOUNDS"
+        sed -i "s|VMESS_UUID_PLACEHOLDER|$VMESS_UUID|g" "$TEMP_INBOUNDS"
+        sed -i "s|\"tag\": \"vmess-in\"|\"tag\": \"${VMESS_TAG}\"|g" "$TEMP_INBOUNDS"
+    fi
+
     # 生成最终配置
     cat > "$CONFIG_PATH" <<'CONFIG_HEAD'
 {
@@ -614,9 +673,13 @@ CONFIG_TAIL
 
     rm -f "$TEMP_INBOUNDS"
 
-    sing-box check -c "$CONFIG_PATH" >/dev/null 2>&1 \
-       && info "配置文件验证通过" \
-       || warn "配置文件验证失败,但继续执行"
+    if sing-box check -c "$CONFIG_PATH" >/dev/null 2>&1; then
+       info "配置文件验证通过"
+    else
+       err "配置文件验证失败，停止继续执行。"
+       sing-box check -c "$CONFIG_PATH" 2>&1 || true
+       exit 1
+    fi
 
     # 保存配置缓存（追加/覆盖）
     cat > /etc/sing-box/.config_cache <<CACHEEOF
@@ -624,6 +687,7 @@ ENABLE_SS=$ENABLE_SS
 ENABLE_HY2=$ENABLE_HY2
 ENABLE_TUIC=$ENABLE_TUIC
 ENABLE_REALITY=$ENABLE_REALITY
+ENABLE_VMESS=$ENABLE_VMESS
 CACHEEOF
 
     $ENABLE_SS && cat >> /etc/sing-box/.config_cache <<CACHEEOF
@@ -652,6 +716,13 @@ REALITY_PUB=$REALITY_PUB
 REALITY_SNI=$REALITY_SNI
 CACHEEOF
 
+    $ENABLE_VMESS && cat >> /etc/sing-box/.config_cache <<CACHEEOF
+VMESS_PORT=$PORT_VMESS
+VMESS_UUID=$VMESS_UUID
+VMESS_SECURITY=chacha20-poly1305
+VMESS_NETWORK=tcp
+CACHEEOF
+
     # 全局写入 CUSTOM_IP（哪怕为空也写）
     echo "CUSTOM_IP=$CUSTOM_IP" >> /etc/sing-box/.config_cache
 
@@ -660,6 +731,11 @@ CACHEEOF
     : > "$SS_META_FILE"
     if $ENABLE_SS; then
         echo "${SS_TAG}|${SS_NODE_NAME:-ss}" >> "$SS_META_FILE"
+    fi
+    VMESS_META_FILE="/etc/sing-box/.vmess_nodes"
+    : > "$VMESS_META_FILE"
+    if $ENABLE_VMESS; then
+        echo "${VMESS_TAG}|${VMESS_NODE_NAME:-vmess}" >> "$VMESS_META_FILE"
     fi
 
     info "配置缓存已保存到 /etc/sing-box/.config_cache"
@@ -856,6 +932,22 @@ generate_uris() {
         echo "vless://${UUID}@${host}:${PORT_REALITY}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}#reality${suffix}"
         echo ""
     fi
+
+    if $ENABLE_VMESS; then
+        echo "=== VMess (TCP) ==="
+        jq -c '.inbounds[] | select(.type=="vmess") | {port:.listen_port,uuid:.users[0].uuid,tag:(.tag//"vmess")}' "$CONFIG_PATH" 2>/dev/null | \
+        while IFS= read -r vmess_item; do
+            local vmess_port vmess_uuid vmess_tag vmess_name
+            vmess_port=$(echo "$vmess_item" | jq -r '.port')
+            vmess_uuid=$(echo "$vmess_item" | jq -r '.uuid')
+            vmess_tag=$(echo "$vmess_item" | jq -r '.tag')
+            vmess_name=$(awk -F'|' -v t="$vmess_tag" '$1==t{print $2}' /etc/sing-box/.vmess_nodes 2>/dev/null | head -n1)
+            vmess_name="${vmess_name:-$vmess_tag}"
+            # VMess 使用 UUID，而不是 password；alterId=0 表示启用 AEAD。
+            echo "vmess://${vmess_uuid}@${host}:${vmess_port}?security=chacha20-poly1305&network=tcp&alterId=0#${vmess_name}"
+        done
+        echo ""
+    fi
 }
 
 # -----------------------
@@ -870,6 +962,7 @@ $ENABLE_SS && echo "   SS 端口: $PORT_SS | 密码: $PSK_SS | 加密: $SS_METHO
 $ENABLE_HY2 && echo "   HY2 端口: $PORT_HY2 | 密码: $PSK_HY2"
 $ENABLE_TUIC && echo "   TUIC 端口: $PORT_TUIC | UUID: $UUID_TUIC | 密码: $PSK_TUIC"
 $ENABLE_REALITY && echo "   Reality 端口: $PORT_REALITY | UUID: $UUID"
+$ENABLE_VMESS && echo "   VMess 端口: $PORT_VMESS | UUID: $VMESS_UUID | alterId: 0 | 传输: tcp(transport) | 回源出站: chacha20-poly1305/tcp"
 echo "   服务器: $PUB_IP"
 echo "   Reality server_name(SNI): ${REALITY_SNI:-addons.mozilla.org}"
 echo ""
@@ -916,6 +1009,7 @@ err()  { echo -e "\033[1;31m[ERR]\033[0m $*" >&2; }
 CONFIG_PATH="/etc/sing-box/config.json"
 CACHE_FILE="/etc/sing-box/.config_cache"
 SS_META_FILE="/etc/sing-box/.ss_nodes"
+VMESS_META_FILE="/etc/sing-box/.vmess_nodes"
 SERVICE_NAME="sing-box"
 
 # 检测系统
@@ -1044,6 +1138,20 @@ read_config() {
         REALITY_SID=$(jq -r '.inbounds[] | select(.type=="vless") | .tls.reality.short_id[0] // empty' "$CONFIG_PATH" | head -n1)
         [ -f /etc/sing-box/.reality_pub ] && REALITY_PUB=$(cat /etc/sing-box/.reality_pub)
     fi
+
+    if [ "${ENABLE_VMESS:-false}" = "true" ]; then
+        VMESS_PORT=$(jq -r '.inbounds[] | select(.type=="vmess") | .listen_port // empty' "$CONFIG_PATH" | head -n1)
+        VMESS_UUID="${SINGBOX_VMESS_UUID:-}"
+        if [ -z "$VMESS_UUID" ]; then
+            VMESS_UUID=$(jq -r '.inbounds[] | select(.type=="vmess") | .users[0].uuid // empty' "$CONFIG_PATH" | head -n1)
+        fi
+        if [ -z "$VMESS_UUID" ]; then
+            err "VMess 需要 UUID。请设置 SINGBOX_VMESS_UUID，或在配置中提供 vmess users[0].uuid。"
+            return 1
+        fi
+        VMESS_SECURITY="chacha20-poly1305"
+        VMESS_NETWORK="tcp"
+    fi
 }
 
 # 获取公网IP（原始方法）
@@ -1111,6 +1219,21 @@ generate_uris() {
         REALITY_SNI="${REALITY_SNI:-addons.mozilla.org}"
         echo "=== VLESS Reality ===" >> "$URI_FILE"
         echo "vless://${REALITY_UUID}@${PUBLIC_IP}:${REALITY_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}#reality${node_suffix}" >> "$URI_FILE"
+        echo "" >> "$URI_FILE"
+    fi
+
+    if [ "${ENABLE_VMESS:-false}" = "true" ]; then
+        echo "=== VMess (TCP) ===" >> "$URI_FILE"
+        jq -c '.inbounds[] | select(.type=="vmess") | {port:.listen_port,uuid:.users[0].uuid,tag:(.tag//"vmess")}' "$CONFIG_PATH" 2>/dev/null | \
+        while IFS= read -r vmess_item; do
+            vmess_port=$(echo "$vmess_item" | jq -r '.port')
+            vmess_uuid=$(echo "$vmess_item" | jq -r '.uuid')
+            vmess_tag=$(echo "$vmess_item" | jq -r '.tag')
+            vmess_name=$(awk -F'|' -v t="$vmess_tag" '$1==t{print $2}' "$VMESS_META_FILE" 2>/dev/null | head -n1)
+            vmess_name="${vmess_name:-$vmess_tag}"
+            # VMess 使用 UUID，不使用 password；alterId=0 即 AEAD。
+            echo "vmess://${vmess_uuid}@${PUBLIC_IP}:${vmess_port}?security=chacha20-poly1305&network=tcp&alterId=0#${vmess_name}" >> "$URI_FILE"
+        done
         echo "" >> "$URI_FILE"
     fi
     
@@ -1258,6 +1381,33 @@ action_reset_reality() {
     generate_uris || warn "生成 URI 失败"
 }
 
+# 重置 VMess 端口
+action_reset_vmess() {
+    read_config || return 1
+
+    if [ "${ENABLE_VMESS:-false}" != "true" ]; then
+        err "VMess 协议未启用"
+        return 1
+    fi
+
+    read -p "输入新的 VMess 端口(回车保持 $VMESS_PORT): " new_port
+    new_port="${new_port:-$VMESS_PORT}"
+
+    info "正在停止服务..."
+    service_stop || warn "停止服务失败"
+
+    cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"
+
+    jq --argjson port "$new_port" '
+    .inbounds |= map(if .type=="vmess" then .listen_port = $port else . end)
+    ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
+
+    info "已启动服务并更新 VMess 端口: $new_port"
+    service_start || warn "启动服务失败"
+    sleep 1
+    generate_uris || warn "生成 URI 失败"
+}
+
 # 新增 SS 节点（支持多节点并存）
 action_add_ss_node() {
     read_config || return 1
@@ -1328,6 +1478,77 @@ action_add_ss_node() {
     generate_uris || warn "生成 URI 失败"
 }
 
+# 新增 VMess 节点（自定义 TCP）
+action_add_vmess_node() {
+    read_config || return 1
+
+    read -p "请输入 VMess 节点名称(默认: vmess-extra): " vmess_name
+    vmess_name="${vmess_name:-vmess-extra}"
+
+    read -p "请输入 VMess 端口(留空随机 10000-60000): " vmess_port
+    vmess_port="${vmess_port:-$(rand_port)}"
+
+    vmess_uuid="${SINGBOX_VMESS_UUID:-}"
+    if [ -z "$vmess_uuid" ]; then
+        vmess_uuid=$(jq -r '.inbounds[] | select(.type=="vmess") | .users[0].uuid // empty' "$CONFIG_PATH" 2>/dev/null | head -n1)
+    fi
+    if [ -z "$vmess_uuid" ]; then
+        warn "未检测到 VMess UUID，自动生成高强度随机 UUID。"
+        vmess_uuid=$(rand_uuid)
+    fi
+
+    vmess_tag_suffix=$(echo "$vmess_name" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]/-/g; s/-\+/-/g; s/^-//; s/-$//')
+    vmess_tag_suffix="${vmess_tag_suffix:-node}"
+    vmess_tag="vmess-in-${vmess_tag_suffix}-$(date +%s)"
+
+    info "正在停止服务..."
+    service_stop || warn "停止服务失败"
+    cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"
+
+    jq --argjson port "$vmess_port" --arg uuid "$vmess_uuid" --arg tag "$vmess_tag" '
+    .inbounds += [{
+      "type": "vmess",
+      "listen": "0.0.0.0",
+      "listen_port": $port,
+      "users": [
+        { "uuid": $uuid, "alterId": 0 }
+      ],
+      "transport": {
+        "type": "tcp"
+      },
+      "tag": $tag
+    }]
+    ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
+
+    touch "$VMESS_META_FILE"
+    echo "${vmess_tag}|${vmess_name}" >> "$VMESS_META_FILE"
+
+    if [ -f "$CACHE_FILE" ]; then
+        sed -i 's/ENABLE_VMESS=false/ENABLE_VMESS=true/' "$CACHE_FILE" 2>/dev/null || true
+        grep -q '^ENABLE_VMESS=' "$CACHE_FILE" || echo 'ENABLE_VMESS=true' >> "$CACHE_FILE"
+        grep -q '^VMESS_PORT=' "$CACHE_FILE" || echo "VMESS_PORT=$vmess_port" >> "$CACHE_FILE"
+        grep -q '^VMESS_UUID=' "$CACHE_FILE" || echo "VMESS_UUID=$vmess_uuid" >> "$CACHE_FILE"
+    else
+        {
+          echo 'ENABLE_VMESS=true'
+          echo "VMESS_PORT=$vmess_port"
+          echo "VMESS_UUID=$vmess_uuid"
+        } > "$CACHE_FILE"
+    fi
+
+    if [ -f /etc/sing-box/.protocols ]; then
+        sed -i 's/ENABLE_VMESS=false/ENABLE_VMESS=true/' /etc/sing-box/.protocols 2>/dev/null || true
+        grep -q '^ENABLE_VMESS=' /etc/sing-box/.protocols || echo 'ENABLE_VMESS=true' >> /etc/sing-box/.protocols
+    else
+        echo 'ENABLE_VMESS=true' > /etc/sing-box/.protocols
+    fi
+
+    info "已新增 VMess 节点: ${vmess_name} (${vmess_port}, chacha20-poly1305, tcp, alterId=0)"
+    service_start || warn "启动服务失败"
+    sleep 1
+    generate_uris || warn "生成 URI 失败"
+}
+
 # 更新sing-box
 action_update() {
     info "开始更新 sing-box..."
@@ -1371,8 +1592,16 @@ action_uninstall() {
 action_generate_relay() {
     read_config || return 1
     
-    # 检查是否启用了SS
-    if [ "${ENABLE_SS:-false}" != "true" ]; then
+    # 默认使用 SS 作为线路机出站；若启用了 VMess，可切换。
+    RELAY_UPSTREAM="ss"
+    if [ "${ENABLE_VMESS:-false}" = "true" ]; then
+        echo "请选择线路机回源协议: 1) SS(默认) 2) VMess(TCP)"
+        read -r relay_choice
+        [ "${relay_choice:-1}" = "2" ] && RELAY_UPSTREAM="vmess"
+    fi
+
+    # 检查是否启用了 SS（仅当 SS 回源时需要）
+    if [ "$RELAY_UPSTREAM" = "ss" ] && [ "${ENABLE_SS:-false}" != "true" ]; then
         warn "未检测到 SS 协议,需要先部署 SS 作为入站"
         read -p "是否现在部署 SS 协议?(y/N): " deploy_ss
         if [[ "$deploy_ss" =~ ^[Yy]$ ]]; then
@@ -1428,6 +1657,18 @@ action_generate_relay() {
             read_config
         else
             err "取消生成线路机脚本"
+            return 1
+        fi
+    fi
+
+    if [ "$RELAY_UPSTREAM" = "vmess" ]; then
+        VMESS_PORT=$(jq -r '.inbounds[] | select(.type=="vmess") | .listen_port // empty' "$CONFIG_PATH" | head -n1)
+        VMESS_UUID="${SINGBOX_VMESS_UUID:-}"
+        if [ -z "$VMESS_UUID" ]; then
+            VMESS_UUID=$(jq -r '.inbounds[] | select(.type=="vmess") | .users[0].uuid // empty' "$CONFIG_PATH" | head -n1)
+        fi
+        if [ -z "$VMESS_PORT" ] || [ -z "$VMESS_UUID" ]; then
+            err "VMess 回源需要已启用 VMess inbound，且提供 UUID（优先 SINGBOX_VMESS_UUID）。"
             return 1
         fi
     fi
@@ -1522,9 +1763,19 @@ cat > /etc/sing-box/config.json <<EOF
       "password": "__INBOUND_PASSWORD__",
       "tag": "relay-out"
     },
+    {
+      "type": "vmess",
+      "server": "__VMESS_SERVER__",
+      "server_port": __VMESS_PORT__,
+      "uuid": "__VMESS_UUID__",
+      "alter_id": 0,
+      "security": "chacha20-poly1305",
+      "network": "tcp",
+      "tag": "relay-vmess-out"
+    },
     { "type": "direct", "tag": "direct-out" }
   ],
-  "route": { "rules": [{ "inbound": "vless-in", "outbound": "relay-out" }] }
+  "route": { "rules": [{ "inbound": "vless-in", "outbound": "__RELAY_OUTBOUND_TAG__" }] }
 }
 EOF
 
@@ -1581,10 +1832,18 @@ RELAY_EOF
 
     # 替换占位符（INBOUND_IP/PORT/METHOD/PASSWORD 同时替换 REALITY_SNI）
     sed -i "s|__INBOUND_IP__|$INBOUND_IP|g" "$RELAY_SCRIPT"
-    sed -i "s|__INBOUND_PORT__|$SS_PORT|g" "$RELAY_SCRIPT"
-    sed -i "s|__INBOUND_METHOD__|$SS_METHOD|g" "$RELAY_SCRIPT"
-    sed -i "s|__INBOUND_PASSWORD__|$SS_PSK|g" "$RELAY_SCRIPT"
+    sed -i "s|__INBOUND_PORT__|${SS_PORT:-0}|g" "$RELAY_SCRIPT"
+    sed -i "s|__INBOUND_METHOD__|${SS_METHOD:-aes-128-gcm}|g" "$RELAY_SCRIPT"
+    sed -i "s|__INBOUND_PASSWORD__|${SS_PSK:-MISSING_PSK}|g" "$RELAY_SCRIPT"
     sed -i "s|__REALITY_SNI__|${REALITY_SNI:-addons.mozilla.org}|g" "$RELAY_SCRIPT"
+    sed -i "s|__VMESS_SERVER__|$INBOUND_IP|g" "$RELAY_SCRIPT"
+    sed -i "s|__VMESS_PORT__|${VMESS_PORT:-443}|g" "$RELAY_SCRIPT"
+    sed -i "s|__VMESS_UUID__|${VMESS_UUID:-00000000-0000-0000-0000-000000000000}|g" "$RELAY_SCRIPT"
+    if [ "$RELAY_UPSTREAM" = "vmess" ]; then
+        sed -i "s|__RELAY_OUTBOUND_TAG__|relay-vmess-out|g" "$RELAY_SCRIPT"
+    else
+        sed -i "s|__RELAY_OUTBOUND_TAG__|relay-out|g" "$RELAY_SCRIPT"
+    fi
     
     chmod +x "$RELAY_SCRIPT"
     
@@ -1643,6 +1902,12 @@ MENU
         MENU_MAP[$option]="reset_reality"
         option=$((option + 1))
     fi
+
+    if [ "${ENABLE_VMESS:-false}" = "true" ]; then
+        echo "$option) 重置 VMess 端口"
+        MENU_MAP[$option]="reset_vmess"
+        option=$((option + 1))
+    fi
     
     # 固定功能选项
     MENU_MAP[$option]="start"
@@ -1671,6 +1936,10 @@ MENU
 
     MENU_MAP[$option]="add_ss"
     echo "$((option))) 新增 SS 节点(自定义参数)"
+    option=$((option + 1))
+
+    MENU_MAP[$option]="add_vmess"
+    echo "$((option))) 新增 VMess 节点(TCP+AEAD)"
     option=$((option + 1))
     
     MENU_MAP[$option]="uninstall"
@@ -1705,6 +1974,7 @@ while true; do
                 reset_hy2) action_reset_hy2 ;;
                 reset_tuic) action_reset_tuic ;;
                 reset_reality) action_reset_reality ;;
+                reset_vmess) action_reset_vmess ;;
                 start) service_start && info "已启动" ;;
                 stop) service_stop && info "已停止" ;;
                 restart) service_restart && info "已重启" ;;
@@ -1712,6 +1982,7 @@ while true; do
                 update) action_update ;;
                 relay) action_generate_relay ;;
                 add_ss) action_add_ss_node ;;
+                add_vmess) action_add_vmess_node ;;
                 uninstall) action_uninstall; exit 0 ;;
                 *) warn "无效选项: $opt" ;;
             esac

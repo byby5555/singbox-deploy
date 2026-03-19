@@ -637,8 +637,9 @@ INBOUND_REALITY
           "alterId": 0
         }
       ],
-      "security": "chacha20-poly1305",
-      "network": "tcp",
+      "transport": {
+        "type": "tcp"
+      },
       "tag": "vmess-in"
     }
 INBOUND_VMESS
@@ -672,9 +673,13 @@ CONFIG_TAIL
 
     rm -f "$TEMP_INBOUNDS"
 
-    sing-box check -c "$CONFIG_PATH" >/dev/null 2>&1 \
-       && info "配置文件验证通过" \
-       || warn "配置文件验证失败,但继续执行"
+    if sing-box check -c "$CONFIG_PATH" >/dev/null 2>&1; then
+       info "配置文件验证通过"
+    else
+       err "配置文件验证失败，停止继续执行。"
+       sing-box check -c "$CONFIG_PATH" 2>&1 || true
+       exit 1
+    fi
 
     # 保存配置缓存（追加/覆盖）
     cat > /etc/sing-box/.config_cache <<CACHEEOF
@@ -957,7 +962,7 @@ $ENABLE_SS && echo "   SS 端口: $PORT_SS | 密码: $PSK_SS | 加密: $SS_METHO
 $ENABLE_HY2 && echo "   HY2 端口: $PORT_HY2 | 密码: $PSK_HY2"
 $ENABLE_TUIC && echo "   TUIC 端口: $PORT_TUIC | UUID: $UUID_TUIC | 密码: $PSK_TUIC"
 $ENABLE_REALITY && echo "   Reality 端口: $PORT_REALITY | UUID: $UUID"
-$ENABLE_VMESS && echo "   VMess 端口: $PORT_VMESS | UUID: $VMESS_UUID | security: chacha20-poly1305 | network: tcp | alterId: 0"
+$ENABLE_VMESS && echo "   VMess 端口: $PORT_VMESS | UUID: $VMESS_UUID | alterId: 0 | 传输: tcp(transport) | 回源出站: chacha20-poly1305/tcp"
 echo "   服务器: $PUB_IP"
 echo "   Reality server_name(SNI): ${REALITY_SNI:-addons.mozilla.org}"
 echo ""
@@ -1508,8 +1513,9 @@ action_add_vmess_node() {
       "users": [
         { "uuid": $uuid, "alterId": 0 }
       ],
-      "security": "chacha20-poly1305",
-      "network": "tcp",
+      "transport": {
+        "type": "tcp"
+      },
       "tag": $tag
     }]
     ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
@@ -1762,7 +1768,7 @@ cat > /etc/sing-box/config.json <<EOF
       "server": "__VMESS_SERVER__",
       "server_port": __VMESS_PORT__,
       "uuid": "__VMESS_UUID__",
-      "alterId": 0,
+      "alter_id": 0,
       "security": "chacha20-poly1305",
       "network": "tcp",
       "tag": "relay-vmess-out"

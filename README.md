@@ -66,7 +66,7 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/byby5555/singbox-deploy/
 - VMess 当前实现为 **纯 TCP**，不启用 TLS / WS / gRPC / Reality。
 - VMess 认证使用 **UUID**，不是 password。
 - `alterId=0`（AEAD），不启用 legacy 模式。
-- 默认 `security=chacha20-poly1305`，`network=tcp`。
+- VMess 回源出站默认 `security=chacha20-poly1305`，`network=tcp`。
 
 ### 环境变量优先级与配置
 
@@ -95,8 +95,9 @@ export SINGBOX_PORT_VMESS="20086"
       "alterId": 0
     }
   ],
-  "security": "chacha20-poly1305",
-  "network": "tcp",
+  "transport": {
+    "type": "tcp"
+  },
   "tag": "vmess-in"
 }
 ```

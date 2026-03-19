@@ -360,12 +360,15 @@ get_config() {
         fi
 
         VMESS_UUID="${SINGBOX_VMESS_UUID:-}"
+        VMESS_UUID_SOURCE="环境变量"
         if [ -z "$VMESS_UUID" ] && [ -f /etc/sing-box/config.json ]; then
             VMESS_UUID=$(jq -r '.inbounds[] | select(.type=="vmess") | .users[0].uuid // empty' /etc/sing-box/config.json 2>/dev/null | head -n1)
+            VMESS_UUID_SOURCE="配置文件"
         fi
         if [ -z "$VMESS_UUID" ]; then
-            err "VMess 需要 UUID。请通过环境变量 SINGBOX_VMESS_UUID 提供，或先在现有配置文件写入 vmess users[0].uuid。"
-            exit 1
+            warn "未检测到 VMess UUID，自动生成高强度随机 UUID。"
+            VMESS_UUID=$(rand_uuid)
+            VMESS_UUID_SOURCE="自动生成"
         fi
 
         VMESS_SECURITY="chacha20-poly1305"
@@ -373,7 +376,7 @@ get_config() {
         VMESS_TAG="vmess-in"
         VMESS_NODE_NAME="vmess${suffix}"
         info "VMess 端口: $PORT_VMESS"
-        info "VMess UUID 来源: ${SINGBOX_VMESS_UUID:+环境变量}${SINGBOX_VMESS_UUID:-配置文件}"
+        info "VMess UUID 来源: $VMESS_UUID_SOURCE"
     fi
     
     info "配置完成，继续安装..."
@@ -1485,8 +1488,8 @@ action_add_vmess_node() {
         vmess_uuid=$(jq -r '.inbounds[] | select(.type=="vmess") | .users[0].uuid // empty' "$CONFIG_PATH" 2>/dev/null | head -n1)
     fi
     if [ -z "$vmess_uuid" ]; then
-        err "VMess 节点需要 UUID。请设置环境变量 SINGBOX_VMESS_UUID，或先在配置中存在 vmess UUID。"
-        return 1
+        warn "未检测到 VMess UUID，自动生成高强度随机 UUID。"
+        vmess_uuid=$(rand_uuid)
     fi
 
     vmess_tag_suffix=$(echo "$vmess_name" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]/-/g; s/-\+/-/g; s/^-//; s/-$//')

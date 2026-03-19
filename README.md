@@ -73,7 +73,7 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/byby5555/singbox-deploy/
 启用 VMess 时，UUID 读取优先级如下：
 1. `SINGBOX_VMESS_UUID`（环境变量，最高优先级）
 2. 现有 `/etc/sing-box/config.json` 中 vmess 用户 UUID
-3. 两者都没有则明确报错（不会静默随机生成）
+3. 两者都没有时自动生成高强度随机 UUID（安装/新增节点时）
 
 可用环境变量：
 
